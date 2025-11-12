@@ -1,0 +1,235 @@
+#include <WiFiS3.h>
+#include <Wire.h>
+#include <BH1750.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
+
+#define WIFI_SSID "Vodafone-7F08"
+#define WIFI_PASSWORD "2Mu7uteeHcdkfz8n"
+#define FIREBASE_HOST "mythesisproject-9336b-default-rtdb.europe-west1.firebasedatabase.app"
+#define SENSOR_PATH "sensor_data"
+#define ACTUATOR_PATH "actuator_data"
+#define FIREBASE_AUTH "AIzaSyAjK2RwV2ukAOM57lxADarv22x2TxosgSQ"
+
+// Sensor pins
+#define MOISTURE_PIN A0
+#define PH_PIN A1
+#define DHT_PIN 2
+#define DHT_TYPE DHT22
+
+// Actuator relay pins
+#define HEATER_RELAY_PIN 3
+#define PUMP_RELAY_PIN 4
+#define FAN_RELAY_PIN 5
+#define HUMIDIFIER_RELAY_PIN 6  // Mist Maker = Humidifier
+
+BH1750 lightSensor;
+DHT dht(DHT_PIN, DHT_TYPE);
+WiFiSSLClient client;
+
+// Actuator states
+bool heaterState = false;
+bool pumpState = false;
+bool fanState = false;
+bool humidifierState = false;
+
+void setup() {
+  Serial.begin(9600);
+  while (!Serial);
+
+  // Initialize actuator pins
+  pinMode(HEATER_RELAY_PIN, OUTPUT);
+  pinMode(PUMP_RELAY_PIN, OUTPUT);
+  pinMode(FAN_RELAY_PIN, OUTPUT);
+  pinMode(HUMIDIFIER_RELAY_PIN, OUTPUT);
+
+  // Turn all relays OFF initially (active-LOW relay)
+  digitalWrite(HEATER_RELAY_PIN, HIGH);
+  digitalWrite(PUMP_RELAY_PIN, HIGH);
+  digitalWrite(FAN_RELAY_PIN, HIGH);
+  digitalWrite(HUMIDIFIER_RELAY_PIN, HIGH);
+
+  Wire.begin();
+  if (!lightSensor.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
+    Serial.println("Error initializing BH1750");
+    while (1);
+  }
+  dht.begin();
+  connectWiFi();
+  
+  Serial.println("System initialized. All actuators OFF.");
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected, attempting to reconnect...");
+    connectWiFi();
+  }
+
+  float moisture = analogRead(MOISTURE_PIN);
+  float phRaw = analogRead(PH_PIN);
+  float lux = lightSensor.readLightLevel();
+  float temp = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  float voltage = phRaw * (5.0 / 1023.0);
+  float pH = 7.0 + (voltage - 4.4) / 0.085;
+
+  if (isnan(temp) || isnan(humidity)) {
+    Serial.println("Failed to read from DHT sensor!");
+    delay(2000);
+    return;
+  }
+
+  Serial.print("Moisture: "); Serial.println(moisture);
+  Serial.print("pH: "); Serial.println(pH);
+  Serial.print("Light: "); Serial.print(lux); Serial.println(" lux");
+  Serial.print("Temp: "); Serial.print(temp); Serial.println(" °C");
+  Serial.print("Humidity: "); Serial.print(humidity); Serial.println(" %");
+
+  sendSensorData(moisture, pH, lux, temp, humidity);
+
+  readAndControlActuators();
+
+  delay(5000);
+}
+
+void sendSensorData(float moisture, float pH, float lux, float temp, float humidity) {
+  // Create JSON payload
+  DynamicJsonDocument json(256);
+  json["moisture"] = moisture;
+  json["ph"] = pH;
+  json["light"] = lux;
+  json["temperature"] = temp;
+  json["humidity"] = humidity;
+  json["timestamp"] = String(millis());
+
+  String jsonStr;
+  serializeJson(json, jsonStr);
+
+  Serial.println("Sending sensor data: " + jsonStr);
+
+  // Send to Firebase
+  if (client.connect(FIREBASE_HOST, 443)) {
+    String path = String(SENSOR_PATH) + "/readings.json?auth=" + String(FIREBASE_AUTH);
+    client.println("PUT /" + path + " HTTP/1.1");
+    client.println("Host: " + String(FIREBASE_HOST));
+    client.println("Content-Type: application/json");
+    client.print("Content-Length: "); client.println(jsonStr.length());
+    client.println();
+    client.println(jsonStr);
+    client.println();
+
+    // Read response
+    String response = "";
+    while (client.connected() || client.available()) {
+      if (client.available()) {
+        response += (char)client.read();
+      }
+    }
+    client.stop();
+
+    if (response.indexOf("200 OK") >= 0) {
+      Serial.println("Sensor data sent successfully");
+    } else {
+      Serial.println("Failed to send sensor data");
+    }
+  } else {
+    Serial.println("Failed to connect to Firebase for sensor data");
+  }
+}
+
+void readAndControlActuators() {
+  if (client.connect(FIREBASE_HOST, 443)) {
+    // Request actuator data
+    String path = String(ACTUATOR_PATH) + ".json?auth=" + String(FIREBASE_AUTH);
+    client.println("GET /" + path + " HTTP/1.1");
+    client.println("Host: " + String(FIREBASE_HOST));
+    client.println("Connection: close");
+    client.println();
+
+    // Read HTTP response
+    bool headersDone = false;
+    String response = "";
+    String jsonResponse = "";
+    
+    while (client.connected() || client.available()) {
+      if (client.available()) {
+        char c = client.read();
+        response += c;
+        
+        if (!headersDone) {
+          if (response.endsWith("\r\n\r\n")) {
+            headersDone = true;
+            response = ""; // Clear headers
+          }
+        } else {
+          jsonResponse += c;
+        }
+      }
+    }
+    client.stop();
+
+    // Parse JSON
+    if (jsonResponse.length() > 0) {
+      Serial.println("Actuator data received: " + jsonResponse);
+      
+      DynamicJsonDocument doc(512);
+      DeserializationError error = deserializeJson(doc, jsonResponse);
+      
+      if (!error) {
+        // Read actuator states from Firebase
+        bool heater = doc["Heater"] | false;
+        bool pump = doc["Pump"] | false;
+        bool fan = doc["Fan"] | false;
+        bool humidifier = doc["Humidifier"] | false;
+        
+        // Control Heater
+        if (heater != heaterState) {
+          heaterState = heater;
+          digitalWrite(HEATER_RELAY_PIN, heater ? LOW : HIGH);
+          Serial.print("Heater: "); Serial.println(heater ? "ON" : "OFF");
+        }
+        
+        // Control Pump
+        if (pump != pumpState) {
+          pumpState = pump;
+          digitalWrite(PUMP_RELAY_PIN, pump ? LOW : HIGH);
+          Serial.print("Pump: "); Serial.println(pump ? "ON" : "OFF");
+        }
+        
+        // Control Fan
+        if (fan != fanState) {
+          fanState = fan;
+          digitalWrite(FAN_RELAY_PIN, fan ? LOW : HIGH);
+          Serial.print("Fan: "); Serial.println(fan ? "ON" : "OFF");
+        }
+        
+        // Control Humidifier
+        if (humidifier != humidifierState) {
+          humidifierState = humidifier;
+          digitalWrite(HUMIDIFIER_RELAY_PIN, humidifier ? LOW : HIGH);
+          Serial.print("Humidifier: "); Serial.println(humidifier ? "ON" : "OFF");
+        }
+        
+      } else {
+        Serial.print("JSON parsing failed: ");
+        Serial.println(error.c_str());
+      }
+    }
+  } else {
+    Serial.println("Failed to connect to Firebase for actuator data");
+  }
+}
+
+void connectWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.print("\nConnected to WiFi. IP: ");
+  Serial.println(WiFi.localIP());
+}
